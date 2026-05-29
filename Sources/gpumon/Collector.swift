@@ -231,6 +231,8 @@ final class Collector {
     private func flush() {
         snapshot.loadAvg1 = pendingLoad
         snapshot.cpuCount = pendingCPUs
+        snapshot.ramTotalMiB = sysMemTotalMiB
+        snapshot.ramUsedMiB = sysMemUsedMiB
         snapshot.lastUpdate = Date()
         if let err = pendingError {
             snapshot.gpus = []

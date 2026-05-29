@@ -11,6 +11,15 @@ let hostConfigs: [HostConfig] = [
 ]
 
 private let frameDefaultsKey = "panelFrame"
+private let zoomDefaultsKey = "zoomLevel"
+
+/// A borderless NSPanel won't accept key events by default, so the ⌘+/⌘−/⌘0 zoom
+/// shortcuts inside the SwiftUI view would never fire. Allowing it to become key
+/// (it stays a non-activating floating panel) lets those shortcuts work once the
+/// widget has been clicked.
+final class KeyablePanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+}
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
@@ -44,12 +53,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
         // Borderless so the content reaches the top edge and the window can sit flush
         // under the menu bar; a titled NSPanel adds an invisible title-bar strip.
-        let panel = NSPanel(
+        let panel = KeyablePanel(
             contentRect: NSRect(x: 0, y: 0, width: 400, height: 200),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
+        panel.becomesKeyOnlyIfNeeded = false
         panel.isMovableByWindowBackground = true
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
@@ -141,6 +151,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
         menu.addItem(NSMenuItem.separator())
 
+        // Zoom lives here rather than as on-panel chrome — rarely touched, so out of the way.
+        let zoomIn = NSMenuItem(title: "Zoom In", action: #selector(zoomIn), keyEquivalent: "+")
+        zoomIn.target = self
+        menu.addItem(zoomIn)
+        let zoomOut = NSMenuItem(title: "Zoom Out", action: #selector(zoomOut), keyEquivalent: "-")
+        zoomOut.target = self
+        menu.addItem(zoomOut)
+        let zoomReset = NSMenuItem(title: "Reset Zoom", action: #selector(zoomReset), keyEquivalent: "0")
+        zoomReset.target = self
+        menu.addItem(zoomReset)
+
+        menu.addItem(NSMenuItem.separator())
+
         // Login Items only makes sense when running as a proper .app bundle.
         if Bundle.main.bundleIdentifier != nil {
             let loginItem = NSMenuItem(title: "Open at Login",
@@ -178,6 +201,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             panel.orderFrontRegardless()
         }
     }
+
+    // MARK: - Zoom (shared with the SwiftUI view via UserDefaults / @AppStorage)
+
+    private var currentZoom: Double {
+        (UserDefaults.standard.object(forKey: zoomDefaultsKey) as? Double) ?? zoomDefault
+    }
+    private func applyZoom(_ v: Double) {
+        UserDefaults.standard.set(clampZoom(v), forKey: zoomDefaultsKey)
+    }
+    @objc private func zoomIn()    { applyZoom(currentZoom + 0.1) }
+    @objc private func zoomOut()   { applyZoom(currentZoom - 0.1) }
+    @objc private func zoomReset() { applyZoom(zoomDefault) }
 
     @objc private func toggleLoginItem() {
         do {

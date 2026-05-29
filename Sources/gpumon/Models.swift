@@ -1,5 +1,24 @@
 import Foundation
 
+/// Standard installed-memory capacities, ascending. `/proc/meminfo` (and nvidia-smi for
+/// unified memory) report kernel-visible RAM, which sits a few percent under the marketed
+/// size — e.g. a 512 GB box reads ~504, a 128 GB box ~120. Snap the *total* back to the
+/// capacity a human recognizes; leave *used* alone so it stays accurate.
+private let ramSteps: [Int] = [
+    1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 160, 192, 256, 320, 384,
+    512, 640, 768, 1024, 1280, 1536, 2048, 3072, 4096, 6144, 8192,
+]
+
+/// Round a kernel-reported MiB figure to the nearest standard capacity when it's within
+/// ~10% below one (the usual reserved-memory gap); otherwise show the literal rounded value.
+func niceCapacityGB(_ miB: Double) -> Int {
+    let gib = miB / 1024
+    for c in ramSteps where Double(c) >= gib {
+        return (Double(c) - gib) / Double(c) <= 0.10 ? c : Int(gib.rounded())
+    }
+    return Int(gib.rounded())
+}
+
 /// A server we monitor. `name` is the ssh alias/host as it appears in ~/.ssh/config or DNS.
 struct HostConfig: Identifiable, Hashable {
     var name: String
@@ -33,6 +52,15 @@ struct GPUStat: Identifiable, Hashable {
     }
     var utilFraction: Double { min(1, max(0, utilization / 100)) }
 
+    /// A card is "active" if it's computing or holding a workload — a resident model at 0% counts.
+    var isActive: Bool { utilization > 0 || job != nil }
+
+    var memUsedGB: Int { Int((memUsedMiB / 1024).rounded()) }
+    /// Discrete VRAM already reads cleanly; unified/system-RAM totals get the marketing snap.
+    var memTotalGB: Int {
+        memIsSystemRAM ? niceCapacityGB(memTotalMiB) : Int((memTotalMiB / 1024).rounded())
+    }
+
     /// "RTX PRO 6000 Blackwell" -> a tight label. Drops the "NVIDIA" prefix and trailing edition words.
     var shortName: String {
         var n = name
@@ -62,6 +90,8 @@ final class HostSnapshot: ObservableObject, Identifiable {
     @Published var gpus: [GPUStat] = []
     @Published var loadAvg1: Double = 0
     @Published var cpuCount: Int = 0
+    @Published var ramUsedMiB: Double = 0   // system RAM, machine-level
+    @Published var ramTotalMiB: Double = 0
     @Published var lastUpdate: Date?
 
     init(_ config: HostConfig) { self.config = config }
@@ -69,6 +99,13 @@ final class HostSnapshot: ObservableObject, Identifiable {
     var cpuLoadFraction: Double {
         cpuCount > 0 ? min(1, loadAvg1 / Double(cpuCount)) : 0
     }
+
+    /// Machine CPU usage as a 0–100 percent, derived from 1-min load average over core count.
+    var cpuPercent: Int { Int((cpuLoadFraction * 100).rounded()) }
+
+    /// Whole-GB system RAM, e.g. used 88 / total 256.
+    var ramUsedGB: Int { Int((ramUsedMiB / 1024).rounded()) }
+    var ramTotalGB: Int { niceCapacityGB(ramTotalMiB) }
 
     var totalWatts: Double { gpus.reduce(0) { $0 + $1.powerW } }
     var totalMemMiB: Double { gpus.reduce(0) { $0 + $1.memTotalMiB } }

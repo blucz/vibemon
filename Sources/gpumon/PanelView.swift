@@ -1,156 +1,368 @@
 import SwiftUI
 
-// MARK: - Color scales
+// MARK: - Design tokens
+//
+// Recreates the "2b · Stacked + host status line" handoff. Solid, opaque surfaces
+// (no vibrancy) so the widget holds contrast over any wallpaper. All numbers are
+// SF Mono with tabular figures; the only bars on screen are per-GPU util/VRAM.
+//
+// Every geometric literal is multiplied by `s` (the user's zoom factor, read from
+// the environment) so the whole widget scales uniformly and re-lays-out crisply —
+// the hosting controller resizes the panel to fit automatically.
+
+private extension Color {
+    init(hex: UInt) {
+        self.init(.sRGB,
+                  red:   Double((hex >> 16) & 0xff) / 255,
+                  green: Double((hex >> 8) & 0xff) / 255,
+                  blue:  Double(hex & 0xff) / 255,
+                  opacity: 1)
+    }
+}
+
+private enum VM {
+    static let bg          = Color(hex: 0x15161A)   // widget body (opaque)
+    static let bgRaise     = Color(hex: 0x1D1F24)   // title bar
+    static let line        = Color(hex: 0x2A2D34)   // widget border
+    static let lineSoft    = Color(hex: 0x232529)   // host dividers, title underline
+    static let fg          = Color(hex: 0xF2F3F5)   // primary text
+    static let fgMid       = Color(hex: 0x9AA0AB)   // secondary text
+    static let fgDim       = Color(hex: 0x5B606B)   // idle/zero, index, separators, units
+    static let blue        = Color(hex: 0x3A9BF4)   // GPU utilization bar
+    static let blueText    = Color(hex: 0x74BDFF)   // active util value
+    static let purple      = Color(hex: 0xA586F5)   // VRAM bar
+    static let track       = Color(hex: 0x2C2F36)   // empty bar track
+    static let cool        = Color(hex: 0x4EC98A)   // temp green
+    static let warm        = Color(hex: 0xF2BE3C)   // temp amber
+    static let hot         = Color(hex: 0xF56A5B)   // temp red
+    static let dotOn       = Color(hex: 0x43C46A)
+    static let dotOff      = Color(hex: 0x5B606B)
+    static let badgeBg     = Color(hex: 0x2A3340)
+    static let badgeFg     = Color(hex: 0xB9C6D6)
+    static let powerStrong = Color(hex: 0xD7DBE2)   // host total power
+    static let vramValue   = Color(hex: 0xC3C8D1)   // VRAM value (non-zero)
+    static let rowActive   = Color(hex: 0x3A9BF4).opacity(0.07)
+    static let rowIdle     = Color.white.opacity(0.018)
+    static let control     = Color(hex: 0x2C2F36)   // title-bar round button bg
+}
 
 private func tempColor(_ c: Double) -> Color {
-    switch c {
-    case ..<60: return Color(red: 0.40, green: 0.78, blue: 0.45)   // green
-    case ..<75: return Color(red: 0.85, green: 0.78, blue: 0.30)   // yellow
-    case ..<85: return Color(red: 0.92, green: 0.58, blue: 0.25)   // orange
-    default:    return Color(red: 0.92, green: 0.33, blue: 0.33)   // red
+    if c >= 83 { return VM.hot }
+    if c >= 65 { return VM.warm }
+    return VM.cool
+}
+
+// MARK: - Zoom (uniform scale factor) plumbed through the environment
+
+private struct UIScaleKey: EnvironmentKey {
+    static let defaultValue: CGFloat = 1.0
+}
+private extension EnvironmentValues {
+    var uiScale: CGFloat {
+        get { self[UIScaleKey.self] }
+        set { self[UIScaleKey.self] = newValue }
     }
 }
 
-private func utilColor(_ frac: Double) -> Color {
-    Color(red: 0.30, green: 0.62, blue: 0.92).opacity(0.55 + 0.45 * frac)
+let zoomMin = 0.6
+let zoomMax = 1.5
+let zoomDefault = 0.8
+
+/// Snap to a 0.05 grid and clamp — keeps steps exact and avoids float drift.
+func clampZoom(_ v: Double) -> Double {
+    min(zoomMax, max(zoomMin, (v * 20).rounded() / 20))
 }
 
-private let memColor = Color(red: 0.55, green: 0.45, blue: 0.85)
+// MARK: - Primitives
 
-func fmtWatts(_ w: Double) -> String {
-    w >= 1000 ? String(format: "%.1fkW", w / 1000) : "\(Int(w.rounded()))W"
-}
-
-/// Whole-GB used/total, e.g. "88/96". Big GPUs and unified memory both read cleanly.
-func fmtMem(used: Double, total: Double) -> String {
-    "\(Int((used / 1024).rounded()))/\(Int((total / 1024).rounded()))G"
-}
-
-// MARK: - Bar
-
-struct MeterBar: View {
+/// A capsule meter: track + leading fill sized to `fraction`. Fills the width it's given.
+private struct VMBar: View {
+    @Environment(\.uiScale) private var s
     var fraction: Double
     var color: Color
-    var width: CGFloat = 46
-    var height: CGFloat = 7
 
     var body: some View {
-        ZStack(alignment: .leading) {
-            RoundedRectangle(cornerRadius: height / 2)
-                .fill(Color.primary.opacity(0.12))
-            RoundedRectangle(cornerRadius: height / 2)
-                .fill(color)
-                .frame(width: max(0, width * CGFloat(min(1, fraction))))
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(VM.track)
+                Capsule().fill(color)
+                    .frame(width: max(0, geo.size.width * min(1, max(0, fraction))))
+            }
         }
-        .frame(width: width, height: height)
+        .frame(height: 6 * s)
     }
 }
 
-// MARK: - One GPU row
+/// Online status dot with a soft glow ring; layout stays dot-sized so the glow doesn't shift things.
+private struct StatusDot: View {
+    @Environment(\.uiScale) private var s
+    var status: HostStatus
 
-struct GPURow: View {
+    private var color: Color {
+        switch status {
+        case .ok:         return VM.dotOn
+        case .warning:    return VM.warm
+        case .offline:    return VM.dotOff
+        case .connecting: return VM.dotOff
+        }
+    }
+
+    var body: some View {
+        let online = { if case .ok = status { return true }; return false }()
+        ZStack {
+            if online {
+                Circle().fill(VM.dotOn.opacity(0.14)).frame(width: 14 * s, height: 14 * s)
+            }
+            Circle().fill(color).frame(width: 8 * s, height: 8 * s)
+        }
+        .frame(width: 8 * s, height: 8 * s)
+    }
+}
+
+private struct CountBadge: View {
+    @Environment(\.uiScale) private var s
+    var count: Int
+    var body: some View {
+        Text("×\(count)")
+            .font(.system(size: 10.5 * s, weight: .semibold, design: .monospaced))
+            .monospacedDigit()
+            .foregroundStyle(VM.badgeFg)
+            .padding(.horizontal, 6 * s)
+            .padding(.vertical, 1.5 * s)
+            .background(RoundedRectangle(cornerRadius: 6 * s).fill(VM.badgeBg))
+    }
+}
+
+/// Small round title-bar button (matches the close button), used for zoom −/+ and close.
+private struct RoundIconButton: View {
+    @Environment(\.uiScale) private var s
+    var systemName: String
+    var glyphSize: CGFloat = 8.5
+    var help: String = ""
+    var action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            ZStack {
+                Circle().fill(VM.control).frame(width: 18 * s, height: 18 * s)
+                Image(systemName: systemName)
+                    .font(.system(size: glyphSize * s, weight: .semibold))
+                    .foregroundStyle(VM.fgMid)
+            }
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+}
+
+// MARK: - GPU card (two lines)
+
+private struct GPUCard: View {
+    @Environment(\.uiScale) private var s
     let gpu: GPUStat
 
     var body: some View {
-        HStack(spacing: 4) {
-            Text("\(gpu.index)")
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                .foregroundStyle(.secondary)
-                .frame(width: 12, alignment: .leading)
+        VStack(alignment: .leading, spacing: 6 * s) {
+            // Line 1 — identity
+            HStack(alignment: .firstTextBaseline, spacing: 8 * s) {
+                Text("\(gpu.index)")
+                    .font(.system(size: 11 * s, design: .monospaced))
+                    .foregroundStyle(VM.fgDim)
 
-            MeterBar(fraction: gpu.utilFraction, color: utilColor(gpu.utilFraction), width: 36)
-            Text("\(Int(gpu.utilization))%")
-                .font(.system(size: 10, design: .monospaced))
-                .frame(width: 30, alignment: .trailing)
+                Text(gpu.job ?? "idle")
+                    .font(.system(size: 12 * s))
+                    .foregroundStyle(gpu.job != nil ? VM.fg : VM.fgDim)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
-            MeterBar(fraction: gpu.memFraction, color: memColor, width: 36)
-            // Width sized to the widest value ("100/128G") and left-aligned so the text
-            // sits right next to its bar instead of floating off with a gap.
-            Text(fmtMem(used: gpu.memUsedMiB, total: gpu.memTotalMiB))
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(.secondary)
-                .frame(width: 52, alignment: .leading)
+                Text("\(Int(gpu.tempC.rounded()))°")
+                    .font(.system(size: 12.5 * s, weight: .semibold, design: .monospaced))
+                    .monospacedDigit()
+                    .foregroundStyle(tempColor(gpu.tempC))
 
-            Text("\(Int(gpu.tempC))°")
-                .font(.system(size: 10, weight: .medium, design: .monospaced))
-                .foregroundStyle(tempColor(gpu.tempC))
-                .frame(width: 26, alignment: .trailing)
+                (Text("\(Int(gpu.powerW.rounded()))").foregroundStyle(VM.fgMid)
+                 + Text("W").foregroundStyle(VM.fgDim))
+                    .font(.system(size: 11 * s, design: .monospaced))
+                    .monospacedDigit()
+                    .frame(minWidth: 42 * s, alignment: .trailing)
+            }
 
-            Text(fmtWatts(gpu.powerW))
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(.secondary)
-                .frame(width: 40, alignment: .trailing)
-
-            // What's running on this GPU — right-aligned so every row shares a clean right edge.
-            Text(gpu.job ?? "—")
-                .font(.system(size: 10))
-                .foregroundStyle(gpu.job == nil ? .tertiary : .primary)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .frame(maxWidth: .infinity, alignment: .trailing)
-                .padding(.leading, 12)
+            // Line 2 — meters (two equal cells: bar fills, value fixed-width so bars align)
+            HStack(spacing: 12 * s) {
+                meterCell {
+                    VMBar(fraction: gpu.utilFraction, color: VM.blue)
+                } value: {
+                    Text("\(Int(gpu.utilization.rounded()))%")
+                        .foregroundStyle(gpu.utilization > 0 ? VM.blueText : VM.fgDim)
+                        .fontWeight(gpu.utilization > 0 ? .semibold : .regular)
+                        .frame(width: 32 * s, alignment: .trailing)
+                }
+                meterCell {
+                    VMBar(fraction: gpu.memFraction, color: VM.purple)
+                } value: {
+                    (Text("\(gpu.memUsedGB)").foregroundStyle(gpu.memUsedGB > 0 ? VM.vramValue : VM.fgDim)
+                     + Text("/\(gpu.memTotalGB)G").foregroundStyle(VM.fgDim))
+                        .frame(width: 58 * s, alignment: .trailing)
+                }
+            }
         }
-        .help("\(gpu.shortName) — \(fmtMem(used: gpu.memUsedMiB, total: gpu.memTotalMiB))B"
-              + (gpu.memIsSystemRAM ? " unified" : "")
-              + (gpu.powerLimitW.map { ", \(Int(gpu.powerW))/\(Int($0))W" } ?? ""))
+        .padding(EdgeInsets(top: 6 * s, leading: 9 * s, bottom: 7 * s, trailing: 9 * s))
+        .background(RoundedRectangle(cornerRadius: 9 * s).fill(gpu.isActive ? VM.rowActive : VM.rowIdle))
+    }
+
+    private func meterCell<Bar: View, Value: View>(
+        @ViewBuilder bar: () -> Bar,
+        @ViewBuilder value: () -> Value
+    ) -> some View {
+        HStack(spacing: 8 * s) {
+            bar()
+            value()
+                .font(.system(size: 10.5 * s, design: .monospaced))
+                .monospacedDigit()
+        }
+        .frame(maxWidth: .infinity)
     }
 }
 
-// MARK: - One host section
+// MARK: - Host section
 
-struct HostSection: View {
+private struct HostSection: View {
+    @Environment(\.uiScale) private var s
     @ObservedObject var host: HostSnapshot
 
-    private var dotColor: Color {
-        switch host.status {
-        case .ok: return Color(red: 0.40, green: 0.78, blue: 0.45)
-        case .warning: return Color(red: 0.92, green: 0.58, blue: 0.25)
-        case .offline: return Color(red: 0.92, green: 0.33, blue: 0.33)
-        case .connecting: return Color.gray
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header
+
+            switch host.status {
+            case .ok:
+                statusLine
+                VStack(spacing: 3 * s) {
+                    ForEach(host.gpus) { GPUCard(gpu: $0) }
+                }
+            case .warning(let msg), .offline(let msg):
+                message(msg)
+            case .connecting:
+                message("connecting…")
+            }
+        }
+        .padding(.horizontal, 13 * s)
+        .padding(.vertical, 9 * s)
+    }
+
+    private var header: some View {
+        HStack(spacing: 8 * s) {
+            StatusDot(status: host.status)
+            Text(host.config.display)
+                .font(.system(size: 14 * s, weight: .semibold))
+                .foregroundStyle(VM.fg)
+                .fixedSize()
+            if let model = host.gpuModelName {
+                Text(model)
+                    .font(.system(size: 10.5 * s))
+                    .foregroundStyle(VM.fgMid)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+            } else {
+                Spacer(minLength: 0)
+            }
+            CountBadge(count: host.gpus.count)
         }
     }
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            // machine name ⟶ (big space) ⟶ GPU model
-            HStack(spacing: 6) {
-                Circle().fill(dotColor).frame(width: 7, height: 7)
-                Text(host.config.display)
-                    .font(.system(size: 11, weight: .semibold))
-                Spacer(minLength: 12)
-                if let model = host.gpuModelName {
-                    HStack(spacing: 4) {
-                        Text(model)
-                            .font(.system(size: 9.5, weight: .medium))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                        // Count badge — a subtle message-style pill.
-                        Text("×\(host.gpus.count)")
-                            .font(.system(size: 8.5, weight: .bold, design: .rounded))
-                            .foregroundStyle(.white.opacity(0.92))
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 1.5)
-                            .background(Capsule().fill(Color(red: 0.34, green: 0.42, blue: 0.56)))
-                    }
-                }
-            }
+    private var statusLine: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8 * s) {
+            Text("\(Int(host.totalWatts.rounded()))W")
+                .font(.system(size: 11 * s, weight: .semibold, design: .monospaced))
+                .monospacedDigit()
+                .foregroundStyle(VM.powerStrong)
+            separator
+            statItem("CPU", "\(host.cpuPercent)%")
+            separator
+            statItem("RAM", "\(host.ramUsedGB)/\(host.ramTotalGB)G")
+        }
+        .padding(.leading, 16 * s)
+        .padding(.top, 5 * s)
+        .padding(.bottom, 8 * s)
+    }
 
-            switch host.status {
-            case .warning(let msg), .offline(let msg):
-                Text(msg)
-                    .font(.system(size: 9.5))
-                    .foregroundStyle(.secondary)
-                    .padding(.leading, 13)
-            case .connecting:
-                Text("connecting…")
-                    .font(.system(size: 9.5))
-                    .foregroundStyle(.tertiary)
-                    .padding(.leading, 13)
-            case .ok:
-                ForEach(host.gpus) { GPURow(gpu: $0) }
+    private var separator: some View {
+        Text("·").font(.system(size: 11 * s)).foregroundStyle(VM.fgDim)
+    }
+
+    private func statItem(_ key: String, _ value: String) -> some View {
+        HStack(spacing: 5 * s) {
+            Text(key)
+                .font(.system(size: 9 * s, weight: .bold))
+                .tracking(0.6 * s)
+                .foregroundStyle(VM.fgDim)
+            Text(value)
+                .font(.system(size: 11 * s, design: .monospaced))
+                .monospacedDigit()
+                .foregroundStyle(VM.fgMid)
+        }
+    }
+
+    private func message(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 11 * s))
+            .foregroundStyle(VM.fgMid)
+            .padding(.leading, 16 * s)
+            .padding(.top, 5 * s)
+            .padding(.bottom, 2 * s)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+// MARK: - Title bar
+
+private struct TitleBarView: View {
+    @Environment(\.uiScale) private var s
+
+    var body: some View {
+        HStack(spacing: 9 * s) {
+            Image(systemName: "cpu")
+                .font(.system(size: 15 * s))
+                .foregroundStyle(VM.fgMid)
+                .frame(width: 17 * s, height: 17 * s)
+            Text("vibemon")
+                .font(.system(size: 13 * s, weight: .semibold))
+                .tracking(0.2 * s)
+                .foregroundStyle(VM.fg)
+                .help("⌘+ / ⌘− to zoom, ⌘0 to reset")
+
+            Spacer()
+
+            RoundIconButton(systemName: "xmark", help: "Quit vibemon") {
+                NSApp.terminate(nil)
             }
         }
-        .padding(.vertical, 2)
+        .padding(.horizontal, 13 * s)
+        .padding(.vertical, 11 * s)
+        .background(VM.bgRaise)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(VM.lineSoft).frame(height: 1)
+        }
+    }
+}
+
+/// Invisible, zero-footprint buttons that register the ⌘+/⌘−/⌘0 zoom shortcuts.
+/// Hidden by design — the widget has no on-screen zoom chrome (see the title tooltip).
+private struct ZoomHotkeys: View {
+    @Binding var zoom: Double
+
+    var body: some View {
+        ZStack {
+            Button("") { zoom = clampZoom(zoom + 0.1) }.keyboardShortcut("+", modifiers: .command)
+            Button("") { zoom = clampZoom(zoom + 0.1) }.keyboardShortcut("=", modifiers: .command)
+            Button("") { zoom = clampZoom(zoom - 0.1) }.keyboardShortcut("-", modifiers: .command)
+            Button("") { zoom = zoomDefault }.keyboardShortcut("0", modifiers: .command)
+        }
+        .frame(width: 0, height: 0)
+        .opacity(0)
+        .accessibilityHidden(true)
     }
 }
 
@@ -158,42 +370,31 @@ struct HostSection: View {
 
 struct ContentView: View {
     @EnvironmentObject var store: MonitorStore
+    @AppStorage("zoomLevel") private var zoom: Double = zoomDefault
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
-                Image(systemName: "cpu")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                Text("vibemon")
-                    .font(.system(size: 11, weight: .bold))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button {
-                    NSApp.terminate(nil)
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.tertiary)
+        let s = CGFloat(zoom)
+        return VStack(spacing: 0) {
+            TitleBarView()
+
+            VStack(spacing: 0) {
+                // Biggest rigs first — the store keeps `hosts` ordered by total VRAM, descending.
+                ForEach(Array(store.hosts.enumerated()), id: \.element.id) { index, host in
+                    if index > 0 {
+                        Rectangle().fill(VM.lineSoft).frame(height: 1)
+                    }
+                    HostSection(host: host)
                 }
-                .buttonStyle(.plain)
-                .help("Quit")
             }
-
-            Divider().opacity(0.4)
-
-            // Biggest rigs first — the store keeps `hosts` ordered by total VRAM, descending.
-            ForEach(store.hosts) { HostSection(host: $0) }
+            .padding(.top, 4 * s)
+            .padding(.bottom, 6 * s)
         }
-        .padding(10)
-        .frame(width: 400, alignment: .leading)
+        .frame(width: 376 * s)
         .fixedSize(horizontal: false, vertical: true)
-        .background {
-            // Material for the blur, plus a dark scrim so text stays legible over any wallpaper.
-            RoundedRectangle(cornerRadius: 10)
-                .fill(.ultraThinMaterial)
-                .overlay(RoundedRectangle(cornerRadius: 10).fill(Color.black.opacity(0.34)))
-                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.white.opacity(0.10)))
-        }
+        .background(VM.bg)
+        .clipShape(RoundedRectangle(cornerRadius: 14 * s))
+        .overlay(RoundedRectangle(cornerRadius: 14 * s).strokeBorder(VM.line, lineWidth: 1))
+        .background(ZoomHotkeys(zoom: $zoom))
+        .environment(\.uiScale, s)
     }
 }
