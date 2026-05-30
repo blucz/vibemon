@@ -25,20 +25,18 @@ open /Applications/vibemon.app
 ```
 
 Click the gauge icon in the menu bar to show/hide the panel or enable Open at Login.
+Closing the panel with the × just hides it — vibemon keeps running in the menu bar, and
+**Quit** lives in that menu.
 
 ## Configure your hosts
 
-Edit `Sources/gpumon/main.swift`:
+Click the **pencil** button on the title bar to enter edit mode, then add a host (type an
+SSH alias or hostname and hit Add) or remove one with the red minus button. The list is
+saved to `UserDefaults` and persists across launches.
 
-```swift
-let hostConfigs: [HostConfig] = [
-    HostConfig("deepmonster"),
-    HostConfig("deepzilla"),
-    HostConfig("spark"),
-]
-```
-
-Each string is an SSH alias or hostname. Rebuild with `./script/build_app.sh`.
+The first-launch default list lives in `Sources/gpumon/main.swift` (`defaultHostNames`) —
+edit it only if you want to change what a fresh install starts with. Each string is an SSH
+alias or hostname.
 
 ## How it works
 

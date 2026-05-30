@@ -138,16 +138,17 @@ private struct RoundIconButton: View {
     @Environment(\.uiScale) private var s
     var systemName: String
     var glyphSize: CGFloat = 8.5
+    var highlighted: Bool = false
     var help: String = ""
     var action: () -> Void
 
     var body: some View {
         Button(action: action) {
             ZStack {
-                Circle().fill(VM.control).frame(width: 18 * s, height: 18 * s)
+                Circle().fill(highlighted ? VM.blue : VM.control).frame(width: 18 * s, height: 18 * s)
                 Image(systemName: systemName)
                     .font(.system(size: glyphSize * s, weight: .semibold))
-                    .foregroundStyle(VM.fgMid)
+                    .foregroundStyle(highlighted ? Color.white : VM.fgMid)
             }
         }
         .buttonStyle(.plain)
@@ -230,6 +231,8 @@ private struct GPUCard: View {
 private struct HostSection: View {
     @Environment(\.uiScale) private var s
     @ObservedObject var host: HostSnapshot
+    var editing: Bool = false
+    var onRemove: () -> Void = {}
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -253,7 +256,17 @@ private struct HostSection: View {
 
     private var header: some View {
         HStack(spacing: 8 * s) {
-            StatusDot(status: host.status)
+            if editing {
+                Button(action: onRemove) {
+                    Image(systemName: "minus.circle.fill")
+                        .font(.system(size: 14 * s))
+                        .foregroundStyle(VM.hot)
+                }
+                .buttonStyle(.plain)
+                .help("Remove \(host.config.display)")
+            } else {
+                StatusDot(status: host.status)
+            }
             Text(host.config.display)
                 .font(.system(size: 14 * s, weight: .semibold))
                 .foregroundStyle(VM.fg)
@@ -320,6 +333,8 @@ private struct HostSection: View {
 
 private struct TitleBarView: View {
     @Environment(\.uiScale) private var s
+    @Binding var editing: Bool
+    var onClose: () -> Void
 
     var body: some View {
         HStack(spacing: 9 * s) {
@@ -327,7 +342,7 @@ private struct TitleBarView: View {
                 .font(.system(size: 15 * s))
                 .foregroundStyle(VM.fgMid)
                 .frame(width: 17 * s, height: 17 * s)
-            Text("vibemon")
+            Text(editing ? "edit hosts" : "vibemon")
                 .font(.system(size: 13 * s, weight: .semibold))
                 .tracking(0.2 * s)
                 .foregroundStyle(VM.fg)
@@ -335,8 +350,14 @@ private struct TitleBarView: View {
 
             Spacer()
 
-            RoundIconButton(systemName: "xmark", help: "Quit vibemon") {
-                NSApp.terminate(nil)
+            RoundIconButton(systemName: editing ? "checkmark" : "pencil",
+                            highlighted: editing,
+                            help: editing ? "Done editing" : "Add or remove hosts") {
+                editing.toggle()
+            }
+            RoundIconButton(systemName: "xmark",
+                            help: "Hide (re-open from the menu bar; Quit lives there too)") {
+                onClose()
             }
         }
         .padding(.horizontal, 13 * s)
@@ -366,16 +387,59 @@ private struct ZoomHotkeys: View {
     }
 }
 
+// MARK: - Add-host row (edit mode)
+
+private struct AddHostRow: View {
+    @Environment(\.uiScale) private var s
+    var onAdd: (String) -> Void
+    @State private var text = ""
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        HStack(spacing: 8 * s) {
+            Image(systemName: "plus.circle.fill")
+                .font(.system(size: 14 * s))
+                .foregroundStyle(VM.dotOn)
+
+            TextField("ssh alias or hostname", text: $text)
+                .textFieldStyle(.plain)
+                .font(.system(size: 13 * s))
+                .foregroundStyle(VM.fg)
+                .focused($focused)
+                .onSubmit(submit)
+
+            Button("Add", action: submit)
+                .buttonStyle(.plain)
+                .font(.system(size: 11 * s, weight: .semibold))
+                .foregroundStyle(text.trimmingCharacters(in: .whitespaces).isEmpty ? VM.fgDim : VM.blueText)
+                .disabled(text.trimmingCharacters(in: .whitespaces).isEmpty)
+        }
+        .padding(.horizontal, 13 * s)
+        .padding(.vertical, 10 * s)
+        .onAppear { focused = true }
+    }
+
+    private func submit() {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return }
+        onAdd(t)
+        text = ""
+        focused = true
+    }
+}
+
 // MARK: - Root
 
 struct ContentView: View {
     @EnvironmentObject var store: MonitorStore
     @AppStorage("zoomLevel") private var zoom: Double = zoomDefault
+    @State private var editing = false
+    var onClose: () -> Void = {}
 
     var body: some View {
         let s = CGFloat(zoom)
         return VStack(spacing: 0) {
-            TitleBarView()
+            TitleBarView(editing: $editing, onClose: onClose)
 
             VStack(spacing: 0) {
                 // Biggest rigs first — the store keeps `hosts` ordered by total VRAM, descending.
@@ -383,7 +447,16 @@ struct ContentView: View {
                     if index > 0 {
                         Rectangle().fill(VM.lineSoft).frame(height: 1)
                     }
-                    HostSection(host: host)
+                    HostSection(host: host,
+                                editing: editing,
+                                onRemove: { store.removeHost(host.id) })
+                }
+
+                if editing {
+                    if !store.hosts.isEmpty {
+                        Rectangle().fill(VM.lineSoft).frame(height: 1)
+                    }
+                    AddHostRow { store.addHost($0) }
                 }
             }
             .padding(.top, 4 * s)

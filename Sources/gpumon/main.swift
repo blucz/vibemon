@@ -2,12 +2,14 @@ import AppKit
 import ServiceManagement
 import SwiftUI
 
-// Hosts to monitor. ssh aliases resolved via ~/.ssh/config or DNS.
-let hostConfigs: [HostConfig] = [
-    HostConfig("deepmonster"),
-    HostConfig("deepmonster2"),
-    HostConfig("deepzilla"),
-    HostConfig("spark"),
+// Default hosts to monitor on first launch. ssh aliases resolved via ~/.ssh/config
+// or DNS. After that the list lives in UserDefaults and is edited in-app (the pencil
+// button on the title bar), so changing these only affects a fresh install.
+let defaultHostNames = [
+    "deepmonster",
+    "deepmonster2",
+    "deepzilla",
+    "spark",
 ]
 
 private let frameDefaultsKey = "panelFrame"
@@ -23,7 +25,7 @@ final class KeyablePanel: NSPanel {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
-    let store = MonitorStore(hostConfigs)
+    let store = MonitorStore(defaults: defaultHostNames)
     var panel: NSPanel!
     var statusItem: NSStatusItem!
 
@@ -42,10 +44,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         store.stop()
     }
 
+    /// Re-launching an already-running accessory app (e.g. `open vibemon.app`, or
+    /// double-clicking it in /Applications) sends a reopen event instead of starting a
+    /// second copy. Use it to bring the panel back — the safety net when the menu-bar
+    /// icon is hidden behind the notch or otherwise hard to find.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        showPanel()
+        return true
+    }
+
     // MARK: - Panel
 
     private func buildPanel() {
-        let root = ContentView().environmentObject(store)
+        // The title-bar × hides the panel (it lives on in the menu bar); Quit is in the menu.
+        let root = ContentView(onClose: { [weak self] in self?.hidePanel() })
+            .environmentObject(store)
         // A hosting *controller* makes the panel track the SwiftUI fitting size — it
         // grows/shrinks to fit every GPU row automatically, keeping top-left fixed.
         let hosting = NSHostingController(rootView: root)
@@ -193,13 +206,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     @objc private func toggleShow() {
-        if panel.isVisible {
-            panel.orderOut(nil)
-        } else {
-            // Make sure it lands somewhere visible if a monitor disappeared while hidden.
-            if !isFrameOnAnyScreen(panel.frame) { positionTopRight(panel) }
-            panel.orderFrontRegardless()
-        }
+        if panel.isVisible { hidePanel() } else { showPanel() }
+    }
+
+    func hidePanel() { panel?.orderOut(nil) }
+
+    func showPanel() {
+        guard let panel else { return }
+        // Make sure it lands somewhere visible if a monitor disappeared while hidden.
+        if !isFrameOnAnyScreen(panel.frame) { positionTopRight(panel) }
+        panel.orderFrontRegardless()
     }
 
     // MARK: - Zoom (shared with the SwiftUI view via UserDefaults / @AppStorage)

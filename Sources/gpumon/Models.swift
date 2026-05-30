@@ -121,31 +121,74 @@ final class HostSnapshot: ObservableObject, Identifiable {
     }
 }
 
+private let hostsDefaultsKey = "hostNames"
+
 @MainActor
 final class MonitorStore: ObservableObject {
     @Published var hosts: [HostSnapshot]
-    private var collectors: [Collector] = []
+    private var collectors: [String: Collector] = [:]
+    private var started = false
 
-    init(_ configs: [HostConfig]) {
-        self.hosts = configs.map(HostSnapshot.init)
+    /// Seed list, used the first time the app runs (before the user has edited the
+    /// host list, which is then persisted to UserDefaults).
+    private let defaults: [String]
+
+    init(defaults: [String]) {
+        self.defaults = defaults
+        let names = MonitorStore.loadHostNames(defaults: defaults)
+        self.hosts = names.map { HostSnapshot(HostConfig($0)) }
+    }
+
+    private static func loadHostNames(defaults: [String]) -> [String] {
+        if let saved = UserDefaults.standard.array(forKey: hostsDefaultsKey) as? [String] {
+            return saved
+        }
+        return defaults
+    }
+
+    private func persist() {
+        UserDefaults.standard.set(hosts.map(\.config.name), forKey: hostsDefaultsKey)
     }
 
     func start() {
-        collectors = hosts.map { snap in
-            let c = Collector(snapshot: snap)
-            c.onUpdate = { [weak self] in self?.resort() }
-            return c
-        }
-        collectors.forEach { $0.start() }
+        started = true
+        hosts.forEach(startCollector)
+    }
+
+    func stop() {
+        started = false
+        collectors.values.forEach { $0.stop() }
+        collectors = [:]
+    }
+
+    private func startCollector(for snap: HostSnapshot) {
+        guard collectors[snap.id] == nil else { return }
+        let c = Collector(snapshot: snap)
+        c.onUpdate = { [weak self] in self?.resort() }
+        collectors[snap.id] = c
+        c.start()
+    }
+
+    /// Add a host by ssh alias / hostname. No-ops on blank or duplicate names.
+    func addHost(_ rawName: String) {
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, !hosts.contains(where: { $0.config.name == name }) else { return }
+        let snap = HostSnapshot(HostConfig(name))
+        hosts.append(snap)
+        if started { startCollector(for: snap) }
+        persist()
+    }
+
+    func removeHost(_ id: String) {
+        collectors[id]?.stop()
+        collectors[id] = nil
+        hosts.removeAll { $0.id == id }
+        persist()
     }
 
     /// Re-order biggest-VRAM-first; only re-publish when the order actually changes.
     private func resort() {
         let sorted = hosts.sorted { $0.totalMemMiB > $1.totalMemMiB }
         if sorted.map(\.id) != hosts.map(\.id) { hosts = sorted }
-    }
-
-    func stop() {
-        collectors.forEach { $0.stop() }
     }
 }
